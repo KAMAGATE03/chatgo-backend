@@ -3,7 +3,7 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 5.2 - Recherche Google Maps avec vraies images et informations complètes
+Version : 5.3 - Ajout des notes et avis, message simplifié
 """
 
 import os
@@ -27,7 +27,6 @@ ENCODING = "utf-8"
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Image par défaut (si SerpApi ne renvoie pas de photo)
 DEFAULT_IMAGE = "https://via.placeholder.com/80?text=Logo"
 
 STOP_WORDS = {
@@ -128,7 +127,7 @@ class DataLoader:
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
     """
     Recherche en ligne via SerpApi Google Maps.
-    Retourne des résultats complets avec nom, adresse, téléphone, photo, etc.
+    Retourne des résultats complets avec nom, adresse, téléphone, photo, note, avis, etc.
     """
     if not SERPAPI_KEY:
         print("[⚠️] SerpApi non configuré (SERPAPI_KEY manquante).")
@@ -153,8 +152,9 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
-                # Prendre la première photo (vraie image)
                 image_url = photos[0] if photos else DEFAULT_IMAGE
+                rating = item.get('rating', 0.0)
+                reviews = item.get('reviews', 0)
 
                 phone_link = f"tel:{phone}" if phone else ''
                 whatsapp_link = f"https://api.whatsapp.com/send?phone={phone.replace(' ', '').replace('+', '')}" if phone else ''
@@ -167,7 +167,9 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
-                    'image_url': image_url,  # ✅ VRAIE IMAGE
+                    'image_url': image_url,
+                    'rating': rating,
+                    'reviews': reviews,
                     'source': 'SerpApi Google Maps'
                 })
             return results
@@ -185,7 +187,7 @@ entreprises = loader.load()
 if not entreprises:
     print("⚠️  Aucune entreprise chargée.")
 
-app = FastAPI(title="Annuaire CI API", version="5.2")
+app = FastAPI(title="Annuaire CI API", version="5.3")
 
 # CORS
 app.add_middleware(
@@ -223,6 +225,8 @@ class CompanyResponse(BaseModel):
     whatsapp_link: str
     google_maps: str
     image_url: Optional[str] = None
+    rating: Optional[float] = None
+    reviews: Optional[int] = None
 
 class ChatResponse(BaseModel):
     reply_text: str
@@ -250,16 +254,12 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-    # 1. RECHERCHE LOCALE (CSV)
+    # 1. RECHERCHE LOCALE
     local_results = loader.search(query, limit=request.limit)
     found_local = len(local_results) > 0
 
     if found_local:
-        reply_text = f"Salut ! J'ai trouvé {len(local_results)} entreprise(s) dans ma base :\n"
-        for r in local_results:
-            reply_text += f"- {r.company_name} ({r.category}) à {r.lieu}\n"
-        reply_text += "Voici les fiches détaillées ci-dessous."
-
+        reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         companies = [
             CompanyResponse(
                 company_name=r.company_name,
@@ -268,7 +268,9 @@ async def chat(
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
-                image_url=r.logo_url or r.image_urls or DEFAULT_IMAGE
+                image_url=r.logo_url or r.image_urls or DEFAULT_IMAGE,
+                rating=float(r.rating) if r.rating and r.rating != '' else None,
+                reviews=int(r.reviews) if r.reviews and r.reviews != '' else None
             )
             for r in local_results
         ]
@@ -279,17 +281,13 @@ async def chat(
             fallback_link=None
         )
 
-    # 2. RECHERCHE EN LIGNE via SerpApi (uniquement si pas de local)
+    # 2. RECHERCHE EN LIGNE via SerpApi
     print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
     found_online = len(online_results) > 0
 
     if found_online:
-        reply_text = f"Salut ! J'ai trouvé {len(online_results)} résultat(s) en ligne pour '{query}' :\n"
-        for r in online_results:
-            reply_text += f"- {r['company_name']}\n"
-        reply_text += "Ces informations proviennent de SerpApi Google Maps."
-
+        reply_text = f" salut J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
         companies = [
             CompanyResponse(
                 company_name=r['company_name'],
@@ -298,7 +296,9 @@ async def chat(
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
-                image_url=r.get('image_url', DEFAULT_IMAGE)
+                image_url=r.get('image_url', DEFAULT_IMAGE),
+                rating=r.get('rating', None),
+                reviews=r.get('reviews', None)
             )
             for r in online_results
         ]
