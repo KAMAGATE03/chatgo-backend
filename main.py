@@ -3,7 +3,7 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 4.3 - Corrections pour 422 et 404
+Version : 4.4 - Utilisation exclusive de SerpApi pour les recherches en ligne
 """
 
 import os
@@ -20,17 +20,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-API_KEY = os.environ.get("CHATGO_API_KEY", "dev-key-change-me")
 CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_complet.csv")
 SEPARATOR = ";"
 ENCODING = "utf-8"
 
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-GOOGLE_CX = os.environ.get("GOOGLE_CX", "")
+# Seule la clé SerpApi est conservée
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
 PORT = int(os.environ.get("PORT", 8000))
-
 
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
@@ -46,8 +43,6 @@ STOP_WORDS = {
     'ce', 'cet', 'cette', 'ces', 'mon', 'ton', 'son',
     'ma', 'ta', 'sa', 'mes', 'tes', 'ses'
 }
-
-
 
 class Entreprise:
     def __init__(self, data: Dict):
@@ -79,7 +74,6 @@ class Entreprise:
 
     def to_dict(self) -> Dict:
         return self.__dict__
-
 
 class DataLoader:
     def __init__(self, filename: str, separator: str = ';', encoding: str = 'utf-8'):
@@ -130,90 +124,52 @@ class DataLoader:
         results.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in results[:limit]]
 
-
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
-    results = []
-
-    if GOOGLE_API_KEY and GOOGLE_CX:
-        try:
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {
-                'key': GOOGLE_API_KEY,
-                'cx': GOOGLE_CX,
-                'q': f"{query} entreprise Côte d'Ivoire",
-                'num': limit,
-                'searchType': 'image',
-            }
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            if 'items' in data:
-                for item in data['items']:
-                    results.append({
-                        'company_name': item.get('title', 'Entreprise'),
-                        'category': 'Non spécifié',
-                        'address': '',
-                        'phone_link': '',
-                        'whatsapp_link': '',
-                        'google_maps': item.get('link', ''),
-                        'image_url': item.get('link', ''),
-                        'source': 'Google Custom Search',
-                    })
-                return results[:limit]
-        except Exception as e:
-            print(f"[⚠️] Erreur Google : {e}")
-
-    if SERPAPI_KEY:
-        try:
-            url = "https://serpapi.com/search"
-            params = {
-                'engine': 'google_images',
-                'q': f"{query} entreprise Côte d'Ivoire",
-                'api_key': SERPAPI_KEY,
-                'num': limit,
-            }
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            if 'images_results' in data:
-                for item in data['images_results']:
-                    results.append({
-                        'company_name': item.get('title', 'Entreprise'),
-                        'category': 'Non spécifié',
-                        'address': '',
-                        'phone_link': '',
-                        'whatsapp_link': '',
-                        'google_maps': item.get('original', ''),
-                        'image_url': item.get('original', ''),
-                        'source': 'SerpApi',
-                    })
-                return results[:limit]
-        except Exception as e:
-            print(f"[⚠️] Erreur SerpApi : {e}")
+    """
+    Recherche en ligne UNIQUEMENT via SerpApi.
+    Retourne une liste de dictionnaires avec les clés :
+    - company_name, category, address, phone_link, whatsapp_link, google_maps, image_url, source
+    """
+    if not SERPAPI_KEY:
+        print("[⚠️] SerpApi non configuré (SERPAPI_KEY manquante).")
+        return []
 
     try:
-        url = "https://api.duckduckgo.com/"
-        params = {'q': query, 'format': 'json', 'no_html': 1, 'skip_disambig': 1}
+        url = "https://serpapi.com/search"
+        params = {
+            'engine': 'google_images',
+            'q': f"{query} entreprise Côte d'Ivoire",
+            'api_key': SERPAPI_KEY,
+            'num': limit,
+        }
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
-        for item in data.get('RelatedTopics', []):
-            if 'Text' in item and 'FirstURL' in item:
-                text = item['Text']
-                name = text.split('.')[0] if '.' in text else text[:50]
+
+        if 'images_results' in data:
+            results = []
+            for item in data['images_results']:
+                title = item.get('title', '')
+                name = title.split(' - ')[0] if ' - ' in title else title[:50]
+                if not name:
+                    name = 'Entreprise trouvée'
                 results.append({
                     'company_name': name,
                     'category': 'Non spécifié',
                     'address': '',
                     'phone_link': '',
                     'whatsapp_link': '',
-                    'google_maps': item.get('FirstURL', ''),
-                    'image_url': '',
-                    'source': 'DuckDuckGo',
+                    'google_maps': item.get('original', ''),
+                    'image_url': item.get('original', ''),
+                    'source': 'SerpApi (images)'
                 })
-        return results[:limit]
+            return results[:limit]
+        else:
+            print(f"[⚠️] Aucune image trouvée via SerpApi pour '{query}'")
+            return []
+
     except Exception as e:
-        print(f"[⚠️] Erreur DuckDuckGo : {e}")
-
-    return []
-
+        print(f"[⚠️] Erreur SerpApi : {e}")
+        return []
 
 loader = DataLoader(CSV_FILE, separator=SEPARATOR, encoding=ENCODING)
 entreprises = loader.load()
@@ -221,9 +177,7 @@ entreprises = loader.load()
 if not entreprises:
     print("⚠️  Aucune entreprise chargée.")
 
-
-
-app = FastAPI(title="Chat&Go API", version="4.3")
+app = FastAPI(title="Chat&Go API", version="4.4")
 
 # CORS
 app.add_middleware(
@@ -234,7 +188,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Gestionnaire d'erreur pour les requêtes mal formées (422)
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):
     return JSONResponse(
@@ -242,8 +195,6 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
         content={"detail": exc.errors(), "body": exc.body},
     )
 
-
-# Routes supplémentaires pour éviter les 404
 @app.get("/models")
 async def models():
     return {"message": "Route non utilisée. Utilisez /chat pour vos requêtes."}
@@ -251,7 +202,6 @@ async def models():
 @app.get("/v1/models")
 async def v1_models():
     return {"message": "Route non utilisée. Utilisez /chat pour vos requêtes."}
-
 
 class ChatRequest(BaseModel):
     message: str
@@ -272,13 +222,11 @@ class ChatResponse(BaseModel):
     results: List[CompanyResponse]
     fallback_link: Optional[str] = None
 
-
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
         "entreprises_chargees": len(entreprises),
-        "google_api_configured": bool(GOOGLE_API_KEY and GOOGLE_CX),
         "serpapi_configured": bool(SERPAPI_KEY)
     }
 
@@ -323,8 +271,8 @@ async def chat(
             fallback_link=None
         )
 
-    # 2. RECHERCHE EN LIGNE
-    print(f"[🔍] Recherche en ligne pour : '{query}'")
+    # 2. RECHERCHE EN LIGNE via SerpApi uniquement
+    print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
     found_online = len(online_results) > 0
 
@@ -332,7 +280,7 @@ async def chat(
         reply_text = f"Je n'ai pas trouvé dans ma base, mais voici des résultats en ligne pour '{query}' :\n"
         for r in online_results:
             reply_text += f"- {r['company_name']}\n"
-        reply_text += "Ces informations proviennent de sources externes."
+        reply_text += "Ces informations proviennent de SerpApi."
 
         companies = [
             CompanyResponse(
@@ -354,15 +302,13 @@ async def chat(
         )
 
     # 3. AUCUN RÉSULTAT
-    reply_text = f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
+    reply_text = f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne (via SerpApi)."
     return ChatResponse(
         reply_text=reply_text,
         found=False,
         results=[],
         fallback_link=None
     )
-
-
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
