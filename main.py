@@ -3,7 +3,7 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 4.4 - Utilisation exclusive de SerpApi pour les recherches en ligne
+Version : 5.2 - Recherche Google Maps avec vraies images et informations complètes
 """
 
 import os
@@ -24,10 +24,11 @@ CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_complet.csv")
 SEPARATOR = ";"
 ENCODING = "utf-8"
 
-# Seule la clé SerpApi est conservée
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
-
 PORT = int(os.environ.get("PORT", 8000))
+
+# Image par défaut (si SerpApi ne renvoie pas de photo)
+DEFAULT_IMAGE = "https://via.placeholder.com/80?text=Logo"
 
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
@@ -126,9 +127,8 @@ class DataLoader:
 
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
     """
-    Recherche en ligne UNIQUEMENT via SerpApi.
-    Retourne une liste de dictionnaires avec les clés :
-    - company_name, category, address, phone_link, whatsapp_link, google_maps, image_url, source
+    Recherche en ligne via SerpApi Google Maps.
+    Retourne des résultats complets avec nom, adresse, téléphone, photo, etc.
     """
     if not SERPAPI_KEY:
         print("[⚠️] SerpApi non configuré (SERPAPI_KEY manquante).")
@@ -137,34 +137,42 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
     try:
         url = "https://serpapi.com/search"
         params = {
-            'engine': 'google_images',
-            'q': f"{query} entreprise Côte d'Ivoire",
+            'engine': 'google_maps',
+            'type': 'search',
+            'q': f"{query} Côte d'Ivoire",
             'api_key': SERPAPI_KEY,
-            'num': limit,
         }
         response = requests.get(url, params=params, timeout=10)
         data = response.json()
 
-        if 'images_results' in data:
-            results = []
-            for item in data['images_results']:
-                title = item.get('title', '')
-                name = title.split(' - ')[0] if ' - ' in title else title[:50]
-                if not name:
-                    name = 'Entreprise trouvée'
+        results = []
+        if 'local_results' in data:
+            for item in data['local_results'][:limit]:
+                name = item.get('title', 'Entreprise')
+                address = item.get('address', '')
+                phone = item.get('phone', '')
+                place_id = item.get('place_id', '')
+                photos = item.get('photos', [])
+                # Prendre la première photo (vraie image)
+                image_url = photos[0] if photos else DEFAULT_IMAGE
+
+                phone_link = f"tel:{phone}" if phone else ''
+                whatsapp_link = f"https://api.whatsapp.com/send?phone={phone.replace(' ', '').replace('+', '')}" if phone else ''
+                google_maps = f"https://www.google.com/maps/place/?q=place_id:{place_id}" if place_id else ''
+
                 results.append({
                     'company_name': name,
                     'category': 'Non spécifié',
-                    'address': '',
-                    'phone_link': '',
-                    'whatsapp_link': '',
-                    'google_maps': item.get('original', ''),
-                    'image_url': item.get('original', ''),
-                    'source': 'SerpApi (images)'
+                    'address': address,
+                    'phone_link': phone_link,
+                    'whatsapp_link': whatsapp_link,
+                    'google_maps': google_maps,
+                    'image_url': image_url,  # ✅ VRAIE IMAGE
+                    'source': 'SerpApi Google Maps'
                 })
-            return results[:limit]
+            return results
         else:
-            print(f"[⚠️] Aucune image trouvée via SerpApi pour '{query}'")
+            print(f"[⚠️] Aucun résultat local trouvé via SerpApi pour '{query}'")
             return []
 
     except Exception as e:
@@ -177,7 +185,7 @@ entreprises = loader.load()
 if not entreprises:
     print("⚠️  Aucune entreprise chargée.")
 
-app = FastAPI(title="Chat&Go API", version="4.4")
+app = FastAPI(title="Annuaire CI API", version="5.2")
 
 # CORS
 app.add_middleware(
@@ -242,12 +250,12 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-    # 1. RECHERCHE LOCALE
+    # 1. RECHERCHE LOCALE (CSV)
     local_results = loader.search(query, limit=request.limit)
     found_local = len(local_results) > 0
 
     if found_local:
-        reply_text = f"J'ai trouvé {len(local_results)} entreprise(s) dans ma base :\n"
+        reply_text = f"Salut ! J'ai trouvé {len(local_results)} entreprise(s) dans ma base :\n"
         for r in local_results:
             reply_text += f"- {r.company_name} ({r.category}) à {r.lieu}\n"
         reply_text += "Voici les fiches détaillées ci-dessous."
@@ -260,7 +268,7 @@ async def chat(
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
-                image_url=r.logo_url or r.image_urls
+                image_url=r.logo_url or r.image_urls or DEFAULT_IMAGE
             )
             for r in local_results
         ]
@@ -271,16 +279,16 @@ async def chat(
             fallback_link=None
         )
 
-    # 2. RECHERCHE EN LIGNE via SerpApi uniquement
+    # 2. RECHERCHE EN LIGNE via SerpApi (uniquement si pas de local)
     print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
     found_online = len(online_results) > 0
 
     if found_online:
-        reply_text = f"Je n'ai pas trouvé dans ma base, mais voici des résultats en ligne pour '{query}' :\n"
+        reply_text = f"Salut ! J'ai trouvé {len(online_results)} résultat(s) en ligne pour '{query}' :\n"
         for r in online_results:
             reply_text += f"- {r['company_name']}\n"
-        reply_text += "Ces informations proviennent de SerpApi."
+        reply_text += "Ces informations proviennent de SerpApi Google Maps."
 
         companies = [
             CompanyResponse(
@@ -290,7 +298,7 @@ async def chat(
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
-                image_url=r.get('image_url', '')
+                image_url=r.get('image_url', DEFAULT_IMAGE)
             )
             for r in online_results
         ]
@@ -302,7 +310,7 @@ async def chat(
         )
 
     # 3. AUCUN RÉSULTAT
-    reply_text = f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne (via SerpApi)."
+    reply_text = f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
     return ChatResponse(
         reply_text=reply_text,
         found=False,
