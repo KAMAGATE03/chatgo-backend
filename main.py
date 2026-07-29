@@ -3,7 +3,7 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 5.3 - Ajout des notes et avis, message simplifié
+Version : 5.4 - Correction du champ image pour compatibilité frontend
 """
 
 import os
@@ -27,8 +27,10 @@ ENCODING = "utf-8"
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 PORT = int(os.environ.get("PORT", 8000))
 
+# Image par défaut si aucune n'est disponible
 DEFAULT_IMAGE = "https://via.placeholder.com/80?text=Logo"
 
+# Stop words pour la recherche locale
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
     'me', 'te', 'se', 'le', 'la', 'les', 'un', 'une', 'des',
@@ -152,6 +154,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
+                # Prendre la première photo, sinon image par défaut
                 image_url = photos[0] if photos else DEFAULT_IMAGE
                 rating = item.get('rating', 0.0)
                 reviews = item.get('reviews', 0)
@@ -167,7 +170,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
-                    'image_url': image_url,
+                    'image': image_url,  # ⬅️ champ 'image' pour le frontend
                     'rating': rating,
                     'reviews': reviews,
                     'source': 'SerpApi Google Maps'
@@ -181,13 +184,14 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
         print(f"[⚠️] Erreur SerpApi : {e}")
         return []
 
+# Chargement initial
 loader = DataLoader(CSV_FILE, separator=SEPARATOR, encoding=ENCODING)
 entreprises = loader.load()
 
 if not entreprises:
     print("⚠️  Aucune entreprise chargée.")
 
-app = FastAPI(title="Annuaire CI API", version="5.3")
+app = FastAPI(title="Annuaire CI API", version="5.4")
 
 # CORS
 app.add_middleware(
@@ -224,7 +228,7 @@ class CompanyResponse(BaseModel):
     phone_link: str
     whatsapp_link: str
     google_maps: str
-    image_url: Optional[str] = None
+    image: Optional[str] = None      # ⬅️ champ 'image' (attendu par Flutter)
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
@@ -268,7 +272,7 @@ async def chat(
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
-                image_url=r.logo_url or r.image_urls or DEFAULT_IMAGE,
+                image=r.logo_url or r.image_urls or DEFAULT_IMAGE,  # ⬅️ champ 'image'
                 rating=float(r.rating) if r.rating and r.rating != '' else None,
                 reviews=int(r.reviews) if r.reviews and r.reviews != '' else None
             )
@@ -287,7 +291,7 @@ async def chat(
     found_online = len(online_results) > 0
 
     if found_online:
-        reply_text = f" salut J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
+        reply_text = f"J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
         companies = [
             CompanyResponse(
                 company_name=r['company_name'],
@@ -296,7 +300,7 @@ async def chat(
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
-                image_url=r.get('image_url', DEFAULT_IMAGE),
+                image=r.get('image', DEFAULT_IMAGE),  # ⬅️ récupère le champ 'image'
                 rating=r.get('rating', None),
                 reviews=r.get('reviews', None)
             )
