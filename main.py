@@ -3,11 +3,12 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 5.4 - Correction du champ image pour compatibilité frontend
+Version : 5.8 - Correction des erreurs de type (NaN → str) et gestion robuste des valeurs manquantes
 """
 
 import os
 import re
+import json
 from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,15 +23,14 @@ load_dotenv()
 
 CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_complet.csv")
 SEPARATOR = ";"
-ENCODING = "utf-8"
+ENCODING = "utf-8"  # Essayez "latin-1" si erreur d'encodage
 
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 PORT = int(os.environ.get("PORT", 8000))
 
-# Image par défaut si aucune n'est disponible
-DEFAULT_IMAGE = "https://via.placeholder.com/80?text=Logo"
 
-# Stop words pour la recherche locale
+# Stop words
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
     'me', 'te', 'se', 'le', 'la', 'les', 'un', 'une', 'des',
@@ -46,13 +46,17 @@ STOP_WORDS = {
     'ma', 'ta', 'sa', 'mes', 'tes', 'ses'
 }
 
+# Valeur par défaut pour les images manquantes
+DEFAULT_IMAGE = "https://via.placeholder.com/512x320?text=No+Image"
+
 class Entreprise:
     def __init__(self, data: Dict):
         self.company_id = data.get('company_id', '')
         self.company_name = data.get('company_name', '')
         self.category = data.get('category', '')
         self.description = data.get('description', '')
-        self.lieu = data.get('lieu', '')
+        self.city = data.get('city', '')
+        self.district = data.get('district', '')
         self.address = data.get('address', '')
         self.latitude = data.get('latitude', '')
         self.longitude = data.get('longitude', '')
@@ -61,7 +65,7 @@ class Entreprise:
         self.whatsapp = data.get('whatsapp', '')
         self.whatsapp_link = data.get('whatsapp_link', '')
         self.email = data.get('email', '')
-        self.email_link = data.get('email_link', '')
+        self.email_link = data.get('email_link', '')  # peut être vide
         self.website = data.get('website', '')
         self.facebook = data.get('facebook', '')
         self.instagram = data.get('instagram', '')
@@ -71,7 +75,7 @@ class Entreprise:
         self.rating = data.get('rating', '')
         self.reviews = data.get('reviews', '')
         self.google_maps = data.get('google_maps', '')
-        self.source = data.get('source', '')
+        self.source_url = data.get('source_url', '')   # ⬅️ corrigé
         self.scraped_at = data.get('scraped_at', '')
 
     def to_dict(self) -> Dict:
@@ -88,6 +92,13 @@ class DataLoader:
         try:
             df = pd.read_csv(self.filename, sep=self.separator, encoding=self.encoding)
             df.columns = df.columns.str.strip()
+            
+            # Vérification des colonnes critiques
+            required = ['city', 'district', 'company_name', 'category', 'address']
+            missing = [col for col in required if col not in df.columns]
+            if missing:
+                print(f"[⚠️] Colonnes manquantes : {missing}. La recherche sera moins précise.")
+            
             for _, row in df.iterrows():
                 data = row.to_dict()
                 for k, v in data.items():
@@ -115,8 +126,17 @@ class DataLoader:
 
         results = []
         for e in self.entreprises:
+            # 🔧 CORRECTION : convertir chaque champ en chaîne, remplacer NaN par ''
+            fields = [
+                str(e.company_name) if pd.notna(e.company_name) else '',
+                str(e.category) if pd.notna(e.category) else '',
+                str(e.city) if pd.notna(e.city) else '',
+                str(e.district) if pd.notna(e.district) else '',
+                str(e.address) if pd.notna(e.address) else ''
+            ]
+            text = ' '.join(fields).lower()
+
             score = 0
-            text = (e.company_name + ' ' + e.category + ' ' + e.lieu + ' ' + e.address).lower()
             for kw in keywords:
                 if kw in text:
                     score += 1
@@ -126,13 +146,10 @@ class DataLoader:
         results.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in results[:limit]]
 
+# --- SerpApi ---
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
-    """
-    Recherche en ligne via SerpApi Google Maps.
-    Retourne des résultats complets avec nom, adresse, téléphone, photo, note, avis, etc.
-    """
     if not SERPAPI_KEY:
-        print("[⚠️] SerpApi non configuré (SERPAPI_KEY manquante).")
+        print("[⚠️] SerpApi non configuré.")
         return []
 
     try:
@@ -154,7 +171,6 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
-                # Prendre la première photo, sinon image par défaut
                 image_url = photos[0] if photos else DEFAULT_IMAGE
                 rating = item.get('rating', 0.0)
                 reviews = item.get('reviews', 0)
@@ -170,7 +186,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
-                    'image': image_url,  # ⬅️ champ 'image' pour le frontend
+                    'image': image_url,
                     'rating': rating,
                     'reviews': reviews,
                     'source': 'SerpApi Google Maps'
@@ -184,16 +200,71 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
         print(f"[⚠️] Erreur SerpApi : {e}")
         return []
 
-# Chargement initial
+# --- Groq ---
+def generate_response_with_groq(query: str, results: List[Dict]) -> str:
+    if not GROQ_API_KEY:
+        print("[⚠️] Groq non configuré.")
+        return ""
+
+    if not results:
+        prompt = f"""
+        L'utilisateur a cherché "{query}" mais je n'ai trouvé aucun résultat en ligne.
+        Propose-lui des suggestions de recherche (autres mots-clés, catégories, lieux) 
+        en restant concis et utile.
+        Réponds en français.
+        """
+    else:
+        summary = "\n".join([
+            f"- {r['company_name']} : {r.get('address', '')} (note {r.get('rating', 'N/A')}/5, {r.get('reviews', 0)} avis)"
+            for r in results
+        ])
+        prompt = f"""
+        L'utilisateur a cherché "{query}". Voici les entreprises trouvées :
+        {summary}
+
+        Rédige une réponse naturelle et engageante qui :
+        - Mentionne le nombre de résultats.
+        - Donne un aperçu des meilleures options.
+        - Propose éventuellement un conseil (ex : appeler pour vérifier les horaires).
+        - Reste court (max 100 mots).
+        Réponds en français.
+        """
+
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama3-70b-8192",
+            "messages": [
+                {"role": "system", "content": "Tu es un assistant utile qui répond aux questions sur les entreprises en Côte d'Ivoire."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 300
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        if response.status_code == 200:
+            data = response.json()
+            return data['choices'][0]['message']['content'].strip()
+        else:
+            print(f"[⚠️] Erreur Groq : {response.status_code} - {response.text}")
+            return ""
+    except Exception as e:
+        print(f"[⚠️] Erreur lors de l'appel Groq : {e}")
+        return ""
+
+# --- Initialisation ---
 loader = DataLoader(CSV_FILE, separator=SEPARATOR, encoding=ENCODING)
 entreprises = loader.load()
 
 if not entreprises:
-    print("⚠️  Aucune entreprise chargée.")
+    print("⚠️  Aucune entreprise chargée. Vérifiez le fichier CSV et son chemin.")
 
-app = FastAPI(title="Annuaire CI API", version="5.4")
+app = FastAPI(title="Annuaire CI API", version="5.8")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -228,7 +299,7 @@ class CompanyResponse(BaseModel):
     phone_link: str
     whatsapp_link: str
     google_maps: str
-    image: Optional[str] = None      # ⬅️ champ 'image' (attendu par Flutter)
+    image: Optional[str] = None
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
@@ -243,7 +314,8 @@ async def health_check():
     return {
         "status": "ok",
         "entreprises_chargees": len(entreprises),
-        "serpapi_configured": bool(SERPAPI_KEY)
+        "serpapi_configured": bool(SERPAPI_KEY),
+        "groq_configured": bool(GROQ_API_KEY)
     }
 
 @app.post("/chat", response_model=ChatResponse)
@@ -258,40 +330,41 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-    # 1. RECHERCHE LOCALE
+    # Recherche locale
     local_results = loader.search(query, limit=request.limit)
-    found_local = len(local_results) > 0
-
-    if found_local:
+    if local_results:
         reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
-        companies = [
-            CompanyResponse(
+        companies = []
+        for r in local_results:
+            # 🔧 Conversion robuste des notes et avis (NaN → None)
+            try:
+                rating_val = float(r.rating) if r.rating and r.rating != '' and pd.notna(r.rating) else None
+            except (ValueError, TypeError):
+                rating_val = None
+            try:
+                reviews_val = int(r.reviews) if r.reviews and r.reviews != '' and pd.notna(r.reviews) else None
+            except (ValueError, TypeError):
+                reviews_val = None
+
+            companies.append(CompanyResponse(
                 company_name=r.company_name,
                 category=r.category,
-                address=r.address or r.lieu,
+                address=r.address or r.city or r.district,
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
-                image=r.logo_url or r.image_urls or DEFAULT_IMAGE,  # ⬅️ champ 'image'
-                rating=float(r.rating) if r.rating and r.rating != '' else None,
-                reviews=int(r.reviews) if r.reviews and r.reviews != '' else None
-            )
-            for r in local_results
-        ]
-        return ChatResponse(
-            reply_text=reply_text,
-            found=True,
-            results=companies,
-            fallback_link=None
-        )
+                image=r.logo_url or r.image_urls or DEFAULT_IMAGE,
+                rating=rating_val,
+                reviews=reviews_val
+            ))
+        return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-    # 2. RECHERCHE EN LIGNE via SerpApi
+    # Recherche en ligne
     print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
-    found_online = len(online_results) > 0
-
-    if found_online:
-        reply_text = f"J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
+    if online_results:
+        groq_text = generate_response_with_groq(query, online_results)
+        reply_text = groq_text if groq_text else f"J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
         companies = [
             CompanyResponse(
                 company_name=r['company_name'],
@@ -300,27 +373,18 @@ async def chat(
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
-                image=r.get('image', DEFAULT_IMAGE),  # ⬅️ récupère le champ 'image'
-                rating=r.get('rating', None),
-                reviews=r.get('reviews', None)
+                image=r.get('image', DEFAULT_IMAGE),
+                rating=r.get('rating'),
+                reviews=r.get('reviews')
             )
             for r in online_results
         ]
-        return ChatResponse(
-            reply_text=reply_text,
-            found=True,
-            results=companies,
-            fallback_link=None
-        )
+        return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-    # 3. AUCUN RÉSULTAT
-    reply_text = f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
-    return ChatResponse(
-        reply_text=reply_text,
-        found=False,
-        results=[],
-        fallback_link=None
-    )
+    # Aucun résultat
+    groq_suggestion = generate_response_with_groq(query, [])
+    reply_text = groq_suggestion if groq_suggestion else f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
+    return ChatResponse(reply_text=reply_text, found=False, results=[])
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
