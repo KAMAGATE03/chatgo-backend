@@ -3,11 +3,12 @@
 
 """
 Backend API pour Annuaire CI - Chat&Go
-Version : 5.9 - Correction complète et robuste des erreurs de type (NaN/float -> str)
+Version 6.0 - Intégration de SerpApi, Groq et Google Places pour les images
 """
 
 import os
 import re
+import time
 from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,16 +21,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Configuration ---
 CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_complet.csv")
 SEPARATOR = ";"
-ENCODING = "utf-8"  # Essayez "latin-1" si erreur d'encodage
+ENCODING = "utf-8"
 
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GOOGLE_PLACES_KEY = os.environ.get("GOOGLE_PLACES_KEY", "")
+
 PORT = int(os.environ.get("PORT", 8000))
 
-
-# Stop words
+# Stop words (inchangé)
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
     'me', 'te', 'se', 'le', 'la', 'les', 'un', 'une', 'des',
@@ -45,16 +48,12 @@ STOP_WORDS = {
     'ma', 'ta', 'sa', 'mes', 'tes', 'ses'
 }
 
-# Valeur par défaut pour les images manquantes
-DEFAULT_IMAGE = "https://via.placeholder.com/512x320?text=No+Image"
+# Valeur par défaut pour les images manquantes (remplacée par un lien fiable)
+DEFAULT_IMAGE = "https://i.imgur.com/H9F2VlU.png"  # ou "https://cdn-icons-png.flaticon.com/512/448/448323.png"
 
 
+# --- Fonctions utilitaires (inchangées) ---
 def safe_str(value) -> str:
-    """
-    Convertit n'importe quelle valeur (float, NaN, None, int...) en chaîne
-    propre et sans espace superflu. Utilisé partout où une valeur issue
-    du CSV/pandas est manipulée comme du texte.
-    """
     if value is None:
         return ''
     try:
@@ -64,9 +63,7 @@ def safe_str(value) -> str:
         pass
     return str(value).strip()
 
-
 def safe_float(value) -> Optional[float]:
-    """Convertit une valeur en float, ou None si impossible/NaN/vide."""
     if value is None or value == '':
         return None
     try:
@@ -79,9 +76,7 @@ def safe_float(value) -> Optional[float]:
     except (ValueError, TypeError):
         return None
 
-
 def safe_int(value) -> Optional[int]:
-    """Convertit une valeur en int, ou None si impossible/NaN/vide."""
     f = safe_float(value)
     if f is None:
         return None
@@ -91,6 +86,7 @@ def safe_int(value) -> Optional[int]:
         return None
 
 
+# --- Classe Entreprise (inchangée) ---
 class Entreprise:
     def __init__(self, data: Dict):
         self.company_id = safe_str(data.get('company_id', ''))
@@ -114,7 +110,6 @@ class Entreprise:
         self.logo_url = safe_str(data.get('logo_url', ''))
         self.image_urls = safe_str(data.get('image_urls', ''))
         self.opening_hours = safe_str(data.get('opening_hours', ''))
-        # rating/reviews restent bruts ici (float/int/None), convertis à l'usage
         self.rating = data.get('rating', None)
         self.reviews = data.get('reviews', None)
         self.google_maps = safe_str(data.get('google_maps', ''))
@@ -125,6 +120,7 @@ class Entreprise:
         return self.__dict__
 
 
+# --- DataLoader (inchangé) ---
 class DataLoader:
     def __init__(self, filename: str, separator: str = ';', encoding: str = 'utf-8'):
         self.filename = filename
@@ -136,16 +132,9 @@ class DataLoader:
         try:
             df = pd.read_csv(self.filename, sep=self.separator, encoding=self.encoding)
             df.columns = df.columns.str.strip()
-
-            required = ['city', 'district', 'company_name', 'category', 'address']
-            missing = [col for col in required if col not in df.columns]
-            if missing:
-                print(f"[⚠️] Colonnes manquantes : {missing}. La recherche sera moins précise.")
-
             for _, row in df.iterrows():
                 data = row.to_dict()
                 self.entreprises.append(Entreprise(data))
-
             print(f"[✅] {len(self.entreprises)} entreprises chargées depuis {self.filename}")
             return self.entreprises
         except FileNotFoundError:
@@ -164,23 +153,56 @@ class DataLoader:
         keywords = self._extract_keywords(query)
         if not keywords:
             keywords = [query.lower()]
-
         results = []
         for e in self.entreprises:
-            # Tous les champs sont déjà des str propres grâce à safe_str() dans Entreprise
             text = ' '.join([
                 e.company_name, e.category, e.city, e.district, e.address
             ]).lower()
-
             score = sum(1 for kw in keywords if kw in text)
             if score > 0:
                 results.append((score, e))
-
         results.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in results[:limit]]
 
 
-# --- SerpApi ---
+# ================== NOUVEAU : Google Places pour les photos ==================
+def fetch_google_place_photo(company_name: str, city: str, address: str) -> str:
+    """
+    Interroge Google Places pour récupérer une photo d'un lieu.
+    Retourne l'URL de l'image ou une chaîne vide si non trouvée.
+    """
+    if not GOOGLE_PLACES_KEY:
+        return ""
+
+    query_parts = [p for p in [company_name, city, address] if p and p.strip()]
+    if not query_parts:
+        return ""
+    query = " ".join(query_parts)
+
+    try:
+        # 1. Rechercher le lieu pour obtenir la photo_reference
+        url = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
+        params = {
+            "input": query,
+            "inputtype": "textquery",
+            "fields": "photos",
+            "key": GOOGLE_PLACES_KEY
+        }
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+
+        candidates = data.get("candidates", [])
+        if candidates and "photos" in candidates[0]:
+            photo_reference = candidates[0]["photos"][0]["photo_reference"]
+            # 2. Construire l'URL finale
+            photo_url = f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photoreference={photo_reference}&key={GOOGLE_PLACES_KEY}"
+            return photo_url
+    except Exception as e:
+        print(f"[⚠️] Erreur Google Places pour {company_name} : {e}")
+    return ""
+
+
+# ================== SERPAPI (inchangé) ==================
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
     if not SERPAPI_KEY:
         print("[⚠️] SerpApi non configuré.")
@@ -205,7 +227,8 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
-                image_url = photos[0] if photos else DEFAULT_IMAGE
+                # Si SerpApi a des photos, on les prend, sinon on utilisera Google Places plus tard
+                image_url = photos[0] if photos else ''
                 rating = safe_float(item.get('rating', 0.0))
                 reviews = safe_int(item.get('reviews', 0))
 
@@ -223,7 +246,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
-                    'image': image_url,
+                    'image': image_url,  # peut être vide
                     'rating': rating,
                     'reviews': reviews,
                     'source': 'SerpApi Google Maps'
@@ -232,13 +255,12 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
         else:
             print(f"[⚠️] Aucun résultat local trouvé via SerpApi pour '{query}'")
             return []
-
     except Exception as e:
         print(f"[⚠️] Erreur SerpApi : {e}")
         return []
 
 
-# --- Groq ---
+# ================== GROQ (inchangé) ==================
 def generate_response_with_groq(query: str, results: List[Dict]) -> str:
     if not GROQ_API_KEY:
         print("[⚠️] Groq non configuré.")
@@ -295,14 +317,14 @@ def generate_response_with_groq(query: str, results: List[Dict]) -> str:
         return ""
 
 
-# --- Initialisation ---
+# ================== INITIALISATION ==================
 loader = DataLoader(CSV_FILE, separator=SEPARATOR, encoding=ENCODING)
 entreprises = loader.load()
 
 if not entreprises:
     print("⚠️  Aucune entreprise chargée. Vérifiez le fichier CSV et son chemin.")
 
-app = FastAPI(title="Annuaire CI API", version="5.9")
+app = FastAPI(title="Annuaire CI API", version="6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -312,7 +334,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# --- Exceptions et routes GET (inchangées) ---
 @app.exception_handler(ValidationError)
 async def validation_exception_handler(request: Request, exc: ValidationError):
     return JSONResponse(
@@ -320,21 +342,18 @@ async def validation_exception_handler(request: Request, exc: ValidationError):
         content={"detail": exc.errors(), "body": getattr(exc, 'body', None)},
     )
 
-
 @app.get("/models")
 async def models():
     return {"message": "Route non utilisée. Utilisez /chat pour vos requêtes."}
-
 
 @app.get("/v1/models")
 async def v1_models():
     return {"message": "Route non utilisée. Utilisez /chat pour vos requêtes."}
 
-
+# --- Pydantic models (inchangés) ---
 class ChatRequest(BaseModel):
     message: str
     limit: int = 5
-
 
 class CompanyResponse(BaseModel):
     company_name: str
@@ -347,24 +366,25 @@ class CompanyResponse(BaseModel):
     rating: Optional[float] = None
     reviews: Optional[int] = None
 
-
 class ChatResponse(BaseModel):
     reply_text: str
     found: bool
     results: List[CompanyResponse]
     fallback_link: Optional[str] = None
 
-
+# --- Health check (inchangé) ---
 @app.get("/health")
 async def health_check():
     return {
         "status": "ok",
         "entreprises_chargees": len(entreprises),
         "serpapi_configured": bool(SERPAPI_KEY),
-        "groq_configured": bool(GROQ_API_KEY)
+        "groq_configured": bool(GROQ_API_KEY),
+        "google_places_configured": bool(GOOGLE_PLACES_KEY)
     }
 
 
+# ================== ROUTE PRINCIPALE /chat AVEC GOOGLE PLACES ==================
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -377,12 +397,18 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-    # Recherche locale
+    # 1. Recherche locale
     local_results = loader.search(query, limit=request.limit)
     if local_results:
-        reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         companies = []
         for r in local_results:
+            # Si l'entreprise locale n'a pas d'image, on tente Google Places
+            img = r.logo_url or r.image_urls or ''
+            if not img:
+                img = fetch_google_place_photo(r.company_name, r.city, r.address)
+            if not img:
+                img = DEFAULT_IMAGE  # fallback
+
             companies.append(CompanyResponse(
                 company_name=r.company_name,
                 category=r.category,
@@ -390,20 +416,40 @@ async def chat(
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
-                image=r.logo_url or r.image_urls or DEFAULT_IMAGE,
+                image=img,
                 rating=safe_float(r.rating),
                 reviews=safe_int(r.reviews)
             ))
+        reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-    # Recherche en ligne
+    # 2. Recherche en ligne via SerpApi
     print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
+
+    # 3. Compléter les images manquantes avec Google Places
+    for res in online_results:
+        if not res.get('image'):
+            # On essaie de récupérer une photo avec Google Places
+            img = fetch_google_place_photo(
+                res['company_name'],
+                '',  # pas de ville spécifique, on peut laisser vide
+                res['address']
+            )
+            if img:
+                res['image'] = img
+
     if online_results:
+        # Générer le texte avec Groq
         groq_text = generate_response_with_groq(query, online_results)
         reply_text = groq_text if groq_text else f"J'ai trouvé {len(online_results)} résultat(s) pour '{query}' :"
-        companies = [
-            CompanyResponse(
+        
+        companies = []
+        for r in online_results:
+            # Si toujours pas d'image, on met le fallback
+            if not r.get('image'):
+                r['image'] = DEFAULT_IMAGE
+            companies.append(CompanyResponse(
                 company_name=r['company_name'],
                 category=r.get('category', 'Non spécifié'),
                 address=r.get('address', ''),
@@ -413,17 +459,16 @@ async def chat(
                 image=r.get('image', DEFAULT_IMAGE),
                 rating=r.get('rating'),
                 reviews=r.get('reviews')
-            )
-            for r in online_results
-        ]
+            ))
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-    # Aucun résultat
+    # 4. Aucun résultat
     groq_suggestion = generate_response_with_groq(query, [])
     reply_text = groq_suggestion if groq_suggestion else f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
     return ChatResponse(reply_text=reply_text, found=False, results=[])
 
 
+# ================== LANCEMENT ==================
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     uvicorn.run(app, host=host, port=PORT, reload=False)
