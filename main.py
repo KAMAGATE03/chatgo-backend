@@ -1,8 +1,6 @@
-
-
 """
 Backend API pour Annuaire CI - Chat&Go
-Version 6.1 - Utilisation de SerpAPI et Groq uniquement
+Version 6.2 - Ajout de la description depuis SerpAPI et Groq
 """
 
 import os
@@ -176,10 +174,12 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
-                # Priorité : la première photo de SerpApi, sinon l'image par défaut
                 image_url = photos[0] if photos else 'https://example.com/default_image.png'
                 rating = safe_float(item.get('rating', 0.0))
                 reviews = safe_int(item.get('reviews', 0))
+                # 🔥 Récupération de la description
+                description = item.get('description', '') or item.get('snippet', '')
+                # Si pas de description, on peut éventuellement en générer une plus tard
 
                 phone_link = f"tel:{phone}" if phone else ''
                 whatsapp_link = (
@@ -192,6 +192,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'company_name': name,
                     'category': 'Non spécifié',
                     'address': address,
+                    'description': description,  # ✅ Nouveau champ
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
@@ -270,9 +271,8 @@ entreprises = loader.load()
 if not entreprises:
     print("⚠️  Aucune entreprise chargée. Vérifiez le fichier CSV et son chemin.")
 
-app = FastAPI(title="Annuaire CI API", version="6.1")
+app = FastAPI(title="Annuaire CI API", version="6.2")
 
-# --- Route racine ajoutée ---
 @app.get("/")
 async def root():
     return {
@@ -314,6 +314,7 @@ class CompanyResponse(BaseModel):
     company_name: str
     category: str
     address: str
+    description: Optional[str] = None  # ✅ Ajout de la description
     phone_link: str
     whatsapp_link: str
     google_maps: str
@@ -349,17 +350,17 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-   
+    # 1. Recherche locale
     local_results = loader.search(query, limit=request.limit)
     if local_results:
         companies = []
         for r in local_results:
-         
-            img = r.logo_url or r.image_urls 
+            img = r.logo_url or r.image_urls
             companies.append(CompanyResponse(
                 company_name=r.company_name,
                 category=r.category,
                 address=r.address or r.city or r.district,
+                description=r.description,  # ✅ On transmet la description du CSV
                 phone_link=r.phone_link,
                 whatsapp_link=r.whatsapp_link,
                 google_maps=r.google_maps,
@@ -370,7 +371,7 @@ async def chat(
         reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-  
+    # 2. Recherche en ligne via SerpApi
     print(f"[🔍] Recherche en ligne via SerpApi pour : '{query}'")
     online_results = search_online_with_images(query, limit=request.limit)
 
@@ -383,6 +384,7 @@ async def chat(
                 company_name=r['company_name'],
                 category=r.get('category', 'Non spécifié'),
                 address=r.get('address', ''),
+                description=r.get('description', ''),  # ✅ Description de SerpAPI
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
@@ -392,7 +394,7 @@ async def chat(
             ))
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
-
+    # 3. Aucun résultat
     groq_suggestion = generate_response_with_groq(query, [])
     reply_text = groq_suggestion if groq_suggestion else f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
     return ChatResponse(reply_text=reply_text, found=False, results=[])
