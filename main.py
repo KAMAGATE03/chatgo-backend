@@ -177,7 +177,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 place_id = item.get('place_id', '')
                 photos = item.get('photos', [])
                 # Priorité : la première photo de SerpApi, sinon l'image par défaut
-                image_url = photos[0] if photos else DEFAULT_IMAGE
+                image_url = photos[0] if photos else 'https://example.com/default_image.png'
                 rating = safe_float(item.get('rating', 0.0))
                 reviews = safe_int(item.get('reviews', 0))
 
