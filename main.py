@@ -1,6 +1,7 @@
 """
 Backend API pour Annuaire CI - Chat&Go
-Version 6.2 - Ajout de la description depuis SerpAPI et Groq
+Version 7.0 - Adaptation pour le CSV extrait (11 colonnes)
+Intègre : recherche locale, SerpAPI (Google Maps), génération Groq
 """
 
 import os
@@ -17,15 +18,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_complet.csv")
-SEPARATOR = ";"
+# ========== CONFIGURATION ==========
+# Fichier CSV généré par le scraper (11 colonnes)
+CSV_FILE = os.environ.get("CHATGO_CSV_FILE", "annuaire_btp_complet.csv")
+SEPARATOR = os.environ.get("CSV_SEPARATOR", ",")   # virgule pour le nouveau CSV
 ENCODING = "utf-8"
 
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 PORT = int(os.environ.get("PORT", 8000))
 
-
+# ========== STOP WORDS (pour nettoyage de requête) ==========
 STOP_WORDS = {
     'je', 'tu', 'il', 'elle', 'on', 'nous', 'vous', 'ils', 'elles',
     'me', 'te', 'se', 'le', 'la', 'les', 'un', 'une', 'des',
@@ -41,6 +44,7 @@ STOP_WORDS = {
     'ma', 'ta', 'sa', 'mes', 'tes', 'ses'
 }
 
+# ========== FONCTIONS UTILITAIRES ==========
 def safe_str(value) -> str:
     if value is None:
         return ''
@@ -73,41 +77,50 @@ def safe_int(value) -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
+# ========== CLASSE ENTREPRISE (adaptée aux colonnes du nouveau CSV) ==========
 class Entreprise:
     def __init__(self, data: Dict):
-        self.company_id = safe_str(data.get('company_id', ''))
-        self.company_name = safe_str(data.get('company_name', ''))
-        self.category = safe_str(data.get('category', ''))
-        self.description = safe_str(data.get('description', ''))
-        self.city = safe_str(data.get('city', ''))
-        self.district = safe_str(data.get('district', ''))
-        self.address = safe_str(data.get('address', ''))
-        self.latitude = safe_str(data.get('latitude', ''))
-        self.longitude = safe_str(data.get('longitude', ''))
-        self.phone = safe_str(data.get('phone', ''))
-        self.phone_link = safe_str(data.get('phone_link', ''))
-        self.whatsapp = safe_str(data.get('whatsapp', ''))
-        self.whatsapp_link = safe_str(data.get('whatsapp_link', ''))
-        self.email = safe_str(data.get('email', ''))
-        self.email_link = safe_str(data.get('email_link', ''))
-        self.website = safe_str(data.get('website', ''))
-        self.facebook = safe_str(data.get('facebook', ''))
-        self.instagram = safe_str(data.get('instagram', ''))
-        self.logo_url = safe_str(data.get('logo_url', ''))
-        self.image_urls = safe_str(data.get('image_urls', ''))
-        self.opening_hours = safe_str(data.get('opening_hours', ''))
-        self.rating = data.get('rating', None)
-        self.reviews = data.get('reviews', None)
-        self.google_maps = safe_str(data.get('google_maps', ''))
-        self.source_url = safe_str(data.get('source_url', ''))
-        self.scraped_at = safe_str(data.get('scraped_at', ''))
+        # Mappage des colonnes du CSV scrappé vers les attributs
+        self.company_name = safe_str(data.get('Nom', ''))
+        self.telephone = safe_str(data.get('Téléphone', ''))
+        self.lien_telephone = safe_str(data.get('Lien téléphone', ''))
+        self.lien_whatsapp = safe_str(data.get('Lien WhatsApp', ''))
+        self.email = safe_str(data.get('Email', ''))
+        self.website = safe_str(data.get('Site web', ''))
+        self.adresse = safe_str(data.get('Adresse', ''))
+        self.description = safe_str(data.get('Description', ''))
+        self.horaires = safe_str(data.get('Horaires', ''))
+        self.localisation = safe_str(data.get('Localisation', ''))
+        self.url = safe_str(data.get('URL', ''))
+        # Champs supplémentaires pour compatibilité avec l'ancienne structure (peuvent rester vides)
+        self.company_id = ''
+        self.category = ''
+        self.city = ''
+        self.district = ''
+        self.latitude = ''
+        self.longitude = ''
+        self.phone = self.telephone
+        self.phone_link = self.lien_telephone
+        self.whatsapp = ''
+        self.whatsapp_link = self.lien_whatsapp
+        self.email_link = f"mailto:{self.email}" if self.email else ''
+        self.facebook = ''
+        self.instagram = ''
+        self.logo_url = ''
+        self.image_urls = ''
+        self.opening_hours = self.horaires
+        self.rating = None
+        self.reviews = None
+        self.google_maps = self.localisation
+        self.source_url = self.url
+        self.scraped_at = ''
 
     def to_dict(self) -> Dict:
         return self.__dict__
 
-
+# ========== CHARGEMENT DU CSV ==========
 class DataLoader:
-    def __init__(self, filename: str, separator: str = ';', encoding: str = 'utf-8'):
+    def __init__(self, filename: str, separator: str = ',', encoding: str = 'utf-8'):
         self.filename = filename
         self.separator = separator
         self.encoding = encoding
@@ -140,8 +153,9 @@ class DataLoader:
             keywords = [query.lower()]
         results = []
         for e in self.entreprises:
+            # Recherche dans nom, adresse, description
             text = ' '.join([
-                e.company_name, e.category, e.city, e.district, e.address
+                e.company_name, e.adresse, e.description
             ]).lower()
             score = sum(1 for kw in keywords if kw in text)
             if score > 0:
@@ -149,7 +163,7 @@ class DataLoader:
         results.sort(key=lambda x: x[0], reverse=True)
         return [e for _, e in results[:limit]]
 
-
+# ========== RECHERCHE EN LIGNE AVEC SERPAPI ==========
 def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
     if not SERPAPI_KEY:
         print("[⚠️] SerpApi non configuré.")
@@ -177,9 +191,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 image_url = photos[0] if photos else 'https://example.com/default_image.png'
                 rating = safe_float(item.get('rating', 0.0))
                 reviews = safe_int(item.get('reviews', 0))
-                # 🔥 Récupération de la description
                 description = item.get('description', '') or item.get('snippet', '')
-                # Si pas de description, on peut éventuellement en générer une plus tard
 
                 phone_link = f"tel:{phone}" if phone else ''
                 whatsapp_link = (
@@ -192,7 +204,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'company_name': name,
                     'category': 'Non spécifié',
                     'address': address,
-                    'description': description,  # ✅ Nouveau champ
+                    'description': description,
                     'phone_link': phone_link,
                     'whatsapp_link': whatsapp_link,
                     'google_maps': google_maps,
@@ -209,7 +221,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
         print(f"[⚠️] Erreur SerpApi : {e}")
         return []
 
-
+# ========== GÉNÉRATION DE RÉPONSE AVEC GROQ ==========
 def generate_response_with_groq(query: str, results: List[Dict]) -> str:
     if not GROQ_API_KEY:
         print("[⚠️] Groq non configuré.")
@@ -265,13 +277,15 @@ def generate_response_with_groq(query: str, results: List[Dict]) -> str:
         print(f"[⚠️] Erreur lors de l'appel Groq : {e}")
         return ""
 
+# ========== INITIALISATION ==========
 loader = DataLoader(CSV_FILE, separator=SEPARATOR, encoding=ENCODING)
 entreprises = loader.load()
 
 if not entreprises:
     print("⚠️  Aucune entreprise chargée. Vérifiez le fichier CSV et son chemin.")
 
-app = FastAPI(title="Annuaire CI API", version="6.2")
+# ========== APPLICATION FASTAPI ==========
+app = FastAPI(title="Annuaire CI API - Chat&Go", version="7.0")
 
 @app.get("/")
 async def root():
@@ -305,7 +319,7 @@ async def models():
 async def v1_models():
     return {"message": "Route non utilisée. Utilisez /chat pour vos requêtes."}
 
-
+# ========== MODÈLES PYDANTIC ==========
 class ChatRequest(BaseModel):
     message: str
     limit: int = 5
@@ -314,7 +328,7 @@ class CompanyResponse(BaseModel):
     company_name: str
     category: str
     address: str
-    description: Optional[str] = None  # ✅ Ajout de la description
+    description: Optional[str] = None
     phone_link: str
     whatsapp_link: str
     google_maps: str
@@ -328,6 +342,7 @@ class ChatResponse(BaseModel):
     results: List[CompanyResponse]
     fallback_link: Optional[str] = None
 
+# ========== ROUTE HEALTH ==========
 @app.get("/health")
 async def health_check():
     return {
@@ -337,7 +352,7 @@ async def health_check():
         "groq_configured": bool(GROQ_API_KEY)
     }
 
-
+# ========== ROUTE CHAT ==========
 @app.post("/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -350,23 +365,22 @@ async def chat(
     if not query:
         raise HTTPException(status_code=400, detail="Message vide")
 
-    # 1. Recherche locale
+    # 1. Recherche locale dans le CSV
     local_results = loader.search(query, limit=request.limit)
     if local_results:
         companies = []
         for r in local_results:
-            img = r.logo_url or r.image_urls
             companies.append(CompanyResponse(
                 company_name=r.company_name,
                 category=r.category,
-                address=r.address or r.city or r.district,
-                description=r.description,  # ✅ On transmet la description du CSV
-                phone_link=r.phone_link,
-                whatsapp_link=r.whatsapp_link,
-                google_maps=r.google_maps,
-                image=img,
-                rating=safe_float(r.rating),
-                reviews=safe_int(r.reviews)
+                address=r.adresse or r.city or r.district,
+                description=r.description,
+                phone_link=r.lien_telephone or r.phone_link,
+                whatsapp_link=r.lien_whatsapp or r.whatsapp_link,
+                google_maps=r.localisation or r.google_maps,
+                image=None,  # pas d'image dans ce CSV
+                rating=None,
+                reviews=None
             ))
         reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
@@ -384,7 +398,7 @@ async def chat(
                 company_name=r['company_name'],
                 category=r.get('category', 'Non spécifié'),
                 address=r.get('address', ''),
-                description=r.get('description', ''),  # ✅ Description de SerpAPI
+                description=r.get('description', ''),
                 phone_link=r.get('phone_link', ''),
                 whatsapp_link=r.get('whatsapp_link', ''),
                 google_maps=r.get('google_maps', ''),
@@ -399,7 +413,7 @@ async def chat(
     reply_text = groq_suggestion if groq_suggestion else f"Je n'ai trouvé aucun résultat pour '{query}', ni localement ni en ligne."
     return ChatResponse(reply_text=reply_text, found=False, results=[])
 
-
+# ========== LANCEMENT ==========
 if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     uvicorn.run(app, host=host, port=PORT, reload=False)
