@@ -92,9 +92,11 @@ class Entreprise:
         self.horaires = safe_str(data.get('Horaires', ''))
         self.localisation = safe_str(data.get('Localisation', ''))
         self.url = safe_str(data.get('URL', ''))
+        # Catégorie : souvent absente du CSV, on essaie plusieurs noms de
+        # colonne possibles ('Category' ou 'Catégorie') avant de laisser vide.
+        self.category = safe_str(data.get('Category', '') or data.get('Catégorie', ''))
         # Champs supplémentaires pour compatibilité avec l'ancienne structure (peuvent rester vides)
         self.company_id = ''
-        self.category = ''
         self.city = ''
         self.district = ''
         self.latitude = ''
@@ -153,9 +155,9 @@ class DataLoader:
             keywords = [query.lower()]
         results = []
         for e in self.entreprises:
-            # Recherche dans nom, adresse, description
+            # Recherche dans nom, catégorie, adresse, description
             text = ' '.join([
-                e.company_name, e.adresse, e.description
+                e.company_name, e.category, e.adresse, e.description
             ]).lower()
             score = sum(1 for kw in keywords if kw in text)
             if score > 0:
@@ -187,11 +189,30 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 address = item.get('address', '')
                 phone = item.get('phone', '')
                 place_id = item.get('place_id', '')
-                photos = item.get('photos', [])
-                image_url = photos[0] if photos else 'https://example.com/default_image.png'
+
+                # Catégorie réelle renvoyée par Google Maps (ex: "Plombier",
+                # "Restaurant"). SerpApi expose soit un champ "type" (str),
+                # soit une liste "types". On ne met "Non spécifié" qu'en
+                # dernier recours, si aucune des deux n'est disponible.
+                types_list = item.get('types') or []
+                category = item.get('type') or (types_list[0] if types_list else '') or 'Non spécifié'
+
+                # Image réelle si SerpApi en fournit une. On ne met JAMAIS
+                # d'URL de substitution : une fausse URL casse l'affichage
+                # côté app (icône image cassée). Si vide, le front affiche
+                # les initiales de l'entreprise à la place.
+                image_url = item.get('thumbnail') or ''
+
                 rating = safe_float(item.get('rating', 0.0))
                 reviews = safe_int(item.get('reviews', 0))
-                description = item.get('description', '') or item.get('snippet', '')
+
+                # Description : on essaie plusieurs champs avant d'abandonner,
+                # pour éviter le "Pas de description disponible" trop souvent.
+                description = (
+                    item.get('description')
+                    or item.get('snippet')
+                    or (', '.join(types_list) if types_list else '')
+                )
 
                 phone_link = f"tel:{phone}" if phone else ''
                 whatsapp_link = (
@@ -200,9 +221,21 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                 )
                 google_maps = f"https://www.google.com/maps/place/?q=place_id:{place_id}" if place_id else ''
 
+                # Horaires : SerpApi renvoie soit un texte "hours" (ex: "Ouvert
+                # · Ferme à 18:00"), soit un objet "operating_hours" détaillé
+                # par jour. On garde le texte s'il existe, sinon on résume
+                # l'objet détaillé.
+                operating_hours = item.get('operating_hours') or {}
+                if item.get('hours'):
+                    hours = item['hours']
+                elif operating_hours:
+                    hours = ' | '.join(f"{day}: {h}" for day, h in operating_hours.items())
+                else:
+                    hours = ''
+
                 results.append({
                     'company_name': name,
-                    'category': 'Non spécifié',
+                    'category': category,
                     'address': address,
                     'description': description,
                     'phone_link': phone_link,
@@ -211,6 +244,7 @@ def search_online_with_images(query: str, limit: int = 5) -> List[Dict]:
                     'image': image_url,
                     'rating': rating,
                     'reviews': reviews,
+                    'hours': hours,
                     'source': 'SerpApi Google Maps'
                 })
             return results
@@ -335,6 +369,7 @@ class CompanyResponse(BaseModel):
     image: Optional[str] = None
     rating: Optional[float] = None
     reviews: Optional[int] = None
+    hours: Optional[str] = None
 
 class ChatResponse(BaseModel):
     reply_text: str
@@ -380,7 +415,8 @@ async def chat(
                 google_maps=r.localisation or r.google_maps,
                 image=None,  # pas d'image dans ce CSV
                 rating=None,
-                reviews=None
+                reviews=None,
+                hours=r.horaires or None
             ))
         reply_text = f"J'ai trouvé {len(local_results)} résultat(s) dans ma base pour '{query}' :"
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
@@ -404,7 +440,8 @@ async def chat(
                 google_maps=r.get('google_maps', ''),
                 image=r.get('image', None),
                 rating=r.get('rating'),
-                reviews=r.get('reviews')
+                reviews=r.get('reviews'),
+                hours=r.get('hours') or None
             ))
         return ChatResponse(reply_text=reply_text, found=True, results=companies)
 
